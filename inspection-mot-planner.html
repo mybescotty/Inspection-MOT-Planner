@@ -293,7 +293,32 @@ const BANK_HOLIDAYS = new Set([
   '2028-01-03','2028-04-14','2028-04-17','2028-05-01','2028-05-29','2028-08-28','2028-12-25','2028-12-26'
 ]);
 
-/* ---- date helpers ---- */
+/* ---- Per-depot MOT defaults (matched by depot code) ----
+   Pre-set so the per-depot table fills in on upload. days: 1=Mon..5=Fri.
+   Any depot NOT listed here defaults to all weekdays ticked + 5 MOTs/week. */
+const DEPOT_DEFAULTS = {
+  '1210':{days:[5],     week:2},     // Adderley Green
+  '2200':{days:[4],     week:4},     // Bradford
+  '2240':{days:[5],     week:4},     // Bramley
+  '6650':{days:[5],     week:0.3},   // Bridgend
+  '2410':{days:[3,5],   week:2},     // Doncaster
+  '2210':{days:[5],     week:2},     // Halifax
+  '6660':{days:[5],     week:0.3},   // Haverfordwest
+  '2230':{days:[5],     week:2},     // Huddersfield
+  '2260':{days:[5],     week:4},     // Hunslet Park
+  '4400':{days:[3,5],   week:2},     // Leicester
+  '2430':{days:[3,5],   week:5},     // Olive Grove
+  '6620':{days:[5],     week:1.7},   // Port Talbot
+  '6700':{days:[5],     week:3},     // Ravenhill
+  '1150':{days:[5],     week:1.5},   // Rochdale
+  '6710':{days:[5],     week:0.25}   // Tycroes
+};
+function depotDefault(code){
+  const d=DEPOT_DEFAULTS[code];
+  return d ? {motDays:new Set(d.days), perWeek:d.week}
+           : {motDays:new Set([1,2,3,4,5]), perWeek:5};
+}
+
 const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 function iso(d){ const z=new Date(d.getTime()-d.getTimezoneOffset()*60000); return z.toISOString().slice(0,10); }
 function fmt(d){ if(!d) return '—'; return d.getDate().toString().padStart(2,'0')+' '+
@@ -436,7 +461,8 @@ function tryBuildDepots(){
   DEPOTS={};
   RAW_FLEET.forEach(v=>{
     const code=v.depotCode||'—';
-    if(!DEPOTS[code]) DEPOTS[code]={code, name:v.depotName, buses:[], motDays:new Set([1,2,3,4,5]), perWeek:10};
+    if(!DEPOTS[code]){ const def=depotDefault(code);
+      DEPOTS[code]={code, name:v.depotName, buses:[], motDays:def.motDays, perWeek:def.perWeek}; }
     DEPOTS[code].buses.push(v.fleet);
     if(v.depotName && (!DEPOTS[code].name || DEPOTS[code].name.startsWith('Depot '))) DEPOTS[code].name=v.depotName;
   });
