@@ -606,18 +606,31 @@ function alignBusMot(b, motDays, dep, capMap){
   return best;
 }
 
-/* Apply a chosen drift to the plan: ramp the shift across the run-up intervals (each ≤ ±nudge),
-   then carry the full drift forward. Marks the aligned inspection + records per-step day changes. */
+/* Apply a chosen drift to the plan. The cumulative shift ramps 0→D across the run-up to the
+   aligned inspection, then ramps D→0 again so the cadence RETURNS to its original dates after the
+   MOT. Every consecutive interval changes by ≤ ±nudge, so each inspection's own move (stepMove) is
+   never more than ±nudge — even though the run total at the aligned step can be larger. */
 function applyDrift(b, a, capMap){
   const {si,D,I,mot,k,firstFut}=a;
-  b.plan.forEach((p,idx)=>{
-    if(p.past || idx<firstFut) return;
-    let shift = idx<=si ? Math.round(D*(idx-firstFut)/Math.max(1,k)) : D;
-    let nd=addDays(p.natural, shift);
-    if(idx!==si && isBlocked(nd)) nd=nextWorking(nd,1);   // keep projected inspections on working days
-    p.date=nd; p.nudged=daysBetween(p.natural,p.date); p.isMot=false;
+  const r=Math.max(1, Math.ceil(Math.abs(D)/Math.max(1,CFG.nudge)));   // steps to unwind the drift
+  const fut=[]; b.plan.forEach((p,idx)=>{ if(!p.past) fut.push(idx); });
+  let prevCum=0, prevDate=null, first=true;
+  fut.forEach(idx=>{
+    const pos=idx-firstFut;
+    let cum;
+    if(idx<firstFut) cum=0;
+    else if(idx<si)  cum=(k>0?Math.round(D*pos/k):0);          // ramp up toward D
+    else if(idx===si) cum=D;                                    // aligned inspection at full drift
+    else { const m=idx-si; cum=(m>=r?0:Math.round(D*(1-m/r))); } // ramp back to original (0)
+    const p=b.plan[idx];
+    p.date = (idx===si) ? new Date(I) : addDays(p.natural, cum);
+    p.cum=cum;
+    p.stepMove = first ? 0 : (cum-prevCum);                     // this inspection's own move (≤ ±nudge)
+    p.interval = prevDate ? daysBetween(prevDate,p.date) : 42;
+    p.isMot=false;
+    prevCum=cum; prevDate=p.date; first=false;
   });
-  b.plan[si].date=I; b.plan[si].nudged=D; b.plan[si].isMot=true;
+  b.plan[si].isMot=true;
   b.inspAlign=b.plan[si]; b.motPlan=mot; b.alignOk=true;
   b.alignGap=daysBetween(I,mot); b.alignDrift=D;
   capMap.set(mondayOf(mot),(capMap.get(mondayOf(mot))||0)+1);
@@ -767,7 +780,7 @@ function showBus(fleet){
   if(b.motDue){
     h+= b.alignOk ?
       '<div class="notice" style="background:#14321f;border-color:#1c5b34;color:#86efac">✓ Inspection on '+
-        fmtDow(b.inspAlign.date)+' (nudged '+(b.inspAlign.nudged>=0?'+':'')+b.inspAlign.nudged+'d) covers the MOT on '+
+        fmtDow(b.inspAlign.date)+' covers the MOT on '+
         fmtDow(b.motPlan)+' — '+b.alignGap+' day gap. One visit serves both.</div>'
       : '<div class="notice">⚠ '+(b.note||'Could not align an inspection to this MOT')+'. MOT planned for '+
         (b.motPlan?fmtDow(b.motPlan):'—')+'.</div>';
@@ -781,9 +794,9 @@ function showBus(fleet){
   b.plan.forEach((p,i)=>{
     const yearEnd=['D','E','F','G'].includes(p.letter);
     const cls=(p.isMot?'mtrow ':'')+(p.past?'past':'');
-    const change = p.nudged
-      ? '<span class="pill warn">moved '+(p.nudged>0?'+':'')+p.nudged+'d</span>'+
-        '<div class="muted small">was '+fmtDow(p.natural)+'</div>'
+    const change = p.stepMove
+      ? '<span class="pill warn">'+(p.stepMove>0?'+':'')+p.stepMove+'d</span>'+
+        '<div class="muted small">'+p.interval+'-day gap</div>'
       : '<span class="muted">—</span>';
     h+='<tr class="'+(p.isMot?'motline':'')+'"><td class="'+cls+'">'+(i+1)+'</td>'+
        '<td class="'+cls+'">'+fmt(p.date)+'</td><td class="'+cls+'">'+DOW[p.date.getDay()]+'</td>'+
@@ -807,7 +820,7 @@ function exportCSV(depotCode){
     const d=DEPOTS[b.depotCode];
     b.plan.forEach(p=>{
       rows.push([b.depotCode,(d?d.name:''),b.fleet,b.reg||'',iso(p.date),DOW[p.date.getDay()],
-        iso(p.natural),(p.nudged?(p.nudged>0?'+':'')+p.nudged+'d':''),p.seq,
+        iso(p.natural),(p.stepMove?(p.stepMove>0?'+':'')+p.stepMove+'d':''),p.seq,
         p.letter,'Yr'+p.year,'Y',(p.isMot?'Y':''),(p.isMot&&b.motPlan?iso(b.motPlan):''),
         b.motDue?iso(b.motDue):'']);
     });
