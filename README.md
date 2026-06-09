@@ -20,10 +20,14 @@ with scope to fix anything found before the certificate expires.
   D E F E D G) is hardcoded and wraps 480→10. Each step is an inspection **plus** the rotating service.
 - Each bus is anchored to its next-due open work order (or projected from its last completed
   service) and stepped forward every 42 days.
-- For each MOT, the run-up cadence is **drifted** (each 42-day interval may flex ±3 days, so over the
-  configurable look-ahead window — default 9 months — an inspection can walk several days) to land an
-  inspection `days-before-test` before an allowed depot MOT day. The MOT is aimed at ~3 weeks before
-  expiry (configurable), never over it, within the depot's weekly capacity. The per-step day changes
-  are shown so you can see the working-out.
+- For each MOT, the run-up cadence is **drifted** (each 42-day interval may flex by at most ±3 days,
+  so over the configurable look-ahead window — default 9 months — an inspection can walk along
+  valid working days to its target) to land an inspection `days-before-test` before an allowed depot
+  MOT day. The MOT is aimed at ~3 weeks before expiry (configurable), never over it, within the
+  depot's weekly capacity. After the MOT the cadence walks back to its original dates.
+- **Hard rules, never broken:** no inspection ever lands on a weekend or a non-working day; no single
+  inspection moves more than ±3 days from the previous one's rhythm. If a bus can't be aligned within
+  these rules, it is **left unaligned and flagged** rather than forced. Per-step day changes are shown
+  so you can see the working-out.
 - Non-working days (configurable Mon–Sun) and UK (England & Wales) bank holidays (toggle) are
   excluded. Buses that can't be aligned (e.g. overdue) are flagged rather than forced.

@@ -360,6 +360,9 @@ function isBlocked(d){
 }
 function nextWorking(d,dir){ dir=dir||1; let x=new Date(d); let guard=0;
   while(isBlocked(x) && guard++<40){ x=addDays(x,dir); } return x; }
+function nearestWorking(d){ if(!isBlocked(d)) return new Date(d);
+  for(let k=1;k<=10;k++){ const a=addDays(d,-k); if(!isBlocked(a)) return a;
+    const b=addDays(d,k); if(!isBlocked(b)) return b; } return new Date(d); }
 
 /* ---- file parsing ---- */
 function readWorkbook(file, cb){
@@ -542,13 +545,16 @@ function findAnchor(hist, today){
 
 function projectPlan(idx,startDate,today){
   const end=addDays(today, Math.round(CFG.horizon*30.5));
-  const plan=[]; let i=idx; let d=new Date(startDate); let guard=0;
+  let d=new Date(startDate); const plan=[]; let i=idx; let guard=0;
   while(d<addDays(today,-CYCLE_DAYS) && guard++<400){ d=addDays(d,CYCLE_DAYS); i=nextIndex(i); }
   guard=0;
   while(d<=end && guard++<400){
     const s=SEQUENCE[i];
-    plan.push({date:new Date(d),natural:new Date(d),idx:i,seq:s.seq,letter:s.letter,year:s.year,
-      inspection:true,isMot:false,past:d<today,nudged:0});
+    // snap every projected inspection to a working day so no inspection ever falls on a
+    // weekend or bank holiday — even before any MOT-alignment drift is applied
+    const wd=nearestWorking(d);
+    plan.push({date:new Date(wd),natural:new Date(wd),idx:i,seq:s.seq,letter:s.letter,year:s.year,
+      inspection:true,isMot:false,past:wd<today,nudged:0});
     d=addDays(d,CYCLE_DAYS); i=nextIndex(i);
   }
   return plan;
@@ -573,66 +579,89 @@ function findMotSlot(motDue, motDays, dep, capMap){
 
 function allowedMot(d,motDays){ return motDays.has(d.getDay()) && !isBlocked(d); }
 
-/* Drift the run-up cadence so an inspection lands CFG.daysBefore before the MOT, with the MOT
-   itself ~CFG.motBuffer days before due (e.g. 3 weeks). MOT-first: for each allowed MOT day in
-   the window we need its inspection (MOT − daysBefore) to be reachable by drifting some cadence
-   step. Each of the k 42-day intervals before a step may flex ±CFG.nudge, so that step can move
-   up to ±(nudge*k) from its natural date. We pick the MOT closest to the 3-weeks-before-due
-   target that is reachable with the least drift. Returns null if nothing is reachable. */
+/* Working-day reachability: from the anchor (cum 0) walk the cadence forward; at each 42-day step
+   the interval may flex by ±CFG.nudge (so cum changes by ≤±nudge) BUT the resulting inspection
+   date (grid + cum) must be a working day. reach[level] maps each reachable cum → its parent cum,
+   so a valid all-working-day, ≤±3-per-step path can be reconstructed. */
+function forwardReach(b, firstFut, lastStep){
+  const reach=[]; reach[firstFut]=new Map([[0,null]]);
+  for(let lvl=firstFut; lvl<lastStep; lvl++){
+    const cur=reach[lvl]; if(!cur || !cur.size) break;
+    const nxt=new Map();
+    cur.forEach((_,cum)=>{
+      for(let dd=-CFG.nudge; dd<=CFG.nudge; dd++){
+        const ncum=cum+dd;
+        if(isBlocked(addDays(b.plan[lvl+1].natural, ncum))) continue;   // inspection must be a working day
+        if(!nxt.has(ncum)) nxt.set(ncum, cum);
+      }
+    });
+    reach[lvl+1]=nxt;
+  }
+  return reach;
+}
+
+/* Aim an inspection CFG.daysBefore before an allowed MOT day (MOT ~CFG.motBuffer before due, never
+   over), but ONLY where the inspection date is reachable by an all-working-day, ≤±3-per-step drift
+   chain. Returns null (→ leave unaligned, never forced) if no rule-respecting alignment exists. */
 function alignBusMot(b, motDays, dep, capMap){
   const due=b.motDue;
   const idealMot=addDays(due, -CFG.motBuffer);
   const winStart=addDays(due, -Math.round(CFG.alignWindowMonths*30.5));
-  const steps=[]; let firstFut=-1;
-  b.plan.forEach((p,idx)=>{ if(!p.past && p.natural<=due && p.natural>=winStart){ if(firstFut<0)firstFut=idx; steps.push(idx); } });
-  if(!steps.length) return null;
+  const steps=[]; let firstFut=-1, lastStep=-1;
+  b.plan.forEach((p,idx)=>{ if(!p.past && p.natural<=due && p.natural>=winStart){ if(firstFut<0)firstFut=idx; lastStep=idx; steps.push(idx); } });
+  if(!steps.length || isBlocked(b.plan[firstFut].natural)) return null;
+  const reach=forwardReach(b, firstFut, lastStep);
   let best=null,bestScore=Infinity;
   for(let M=new Date(winStart); M<=due; M=addDays(M,1)){
     if(!allowedMot(M,motDays)) continue;                        // depot MOT day, not blocked
     if((capMap.get(mondayOf(M))||0) >= dep.perWeek) continue;   // weekly capacity free
-    let I=addDays(M, -CFG.daysBefore);                          // inspection sits daysBefore earlier
-    if(isBlocked(I)) I=nextWorking(I,-1);                       // keep the inspection on a working day
+    let I=addDays(M, -CFG.daysBefore);
+    if(isBlocked(I)) I=nextWorking(I,-1);                       // inspection on a working day
     if(I>=M) continue;
-    // find the cadence step that can reach I with the least drift
-    let si=-1,D=1e9;
-    steps.forEach(s=>{ const k=s-firstFut; const maxDrift=CFG.nudge*Math.max(1,k);
-      const d=daysBetween(b.plan[s].natural, I);
-      if(Math.abs(d)<=maxDrift && Math.abs(d)<Math.abs(D)){ si=s; D=d; } });
-    if(si<0) continue;
-    // prefer MOT nearest the 3-weeks-before-due target; tie-break on least cadence disruption
-    const score=Math.abs(daysBetween(M,idealMot))*3 + Math.abs(D);
-    if(score<bestScore){ bestScore=score; best={si,D,I:new Date(I),mot:new Date(M),k:si-firstFut,firstFut}; }
+    steps.forEach(si=>{
+      if(!reach[si]) return;
+      const C=daysBetween(b.plan[si].natural, I);
+      if(!reach[si].has(C)) return;                            // I reachable by a working-day ≤±3 chain
+      const score=Math.abs(daysBetween(M,idealMot))*3 + Math.abs(C);
+      if(score<bestScore){ bestScore=score; best={si,C,I:new Date(I),mot:new Date(M),firstFut,reach}; }
+    });
   }
   return best;
 }
 
-/* Apply a chosen drift to the plan. The cumulative shift ramps 0→D across the run-up to the
-   aligned inspection, then ramps D→0 again so the cadence RETURNS to its original dates after the
-   MOT. Every consecutive interval changes by ≤ ±nudge, so each inspection's own move (stepMove) is
-   never more than ±nudge — even though the run total at the aligned step can be larger. */
+/* Apply the chosen alignment: reconstruct the working-day drift path up to the aligned inspection,
+   then walk the cadence back toward its original dates afterward. Every step stays on a working day
+   and moves ≤±nudge; stepMove records each inspection's own move (never more than ±nudge). */
 function applyDrift(b, a, capMap){
-  const {si,D,I,mot,k,firstFut}=a;
-  const r=Math.max(1, Math.ceil(Math.abs(D)/Math.max(1,CFG.nudge)));   // steps to unwind the drift
-  const fut=[]; b.plan.forEach((p,idx)=>{ if(!p.past) fut.push(idx); });
-  let prevCum=0, prevDate=null, first=true;
-  fut.forEach(idx=>{
-    const pos=idx-firstFut;
-    let cum;
-    if(idx<firstFut) cum=0;
-    else if(idx<si)  cum=(k>0?Math.round(D*pos/k):0);          // ramp up toward D
-    else if(idx===si) cum=D;                                    // aligned inspection at full drift
-    else { const m=idx-si; cum=(m>=r?0:Math.round(D*(1-m/r))); } // ramp back to original (0)
-    const p=b.plan[idx];
-    p.date = (idx===si) ? new Date(I) : addDays(p.natural, cum);
-    p.cum=cum;
-    p.stepMove = first ? 0 : (cum-prevCum);                     // this inspection's own move (≤ ±nudge)
-    p.interval = prevDate ? daysBetween(prevDate,p.date) : 42;
-    p.isMot=false;
+  const {si,C,I,mot,firstFut,reach}=a;
+  const cumAt={}; let lvl=si, cur=C;
+  while(lvl>=firstFut){ cumAt[lvl]=cur; if(lvl===firstFut) break; cur=reach[lvl].get(cur); lvl--; }
+  let prevDate=null, prevCum=0, first=true;
+  for(let idx=firstFut; idx<=si; idx++){
+    const cum=cumAt[idx], p=b.plan[idx];
+    p.date = idx===si ? new Date(I) : addDays(p.natural, cum);
+    p.cum=cum; p.stepMove=first?0:(cum-prevCum); p.interval=prevDate?daysBetween(prevDate,p.date):42; p.isMot=false;
     prevCum=cum; prevDate=p.date; first=false;
-  });
+  }
+  // revert: each later inspection moves ≤±nudge on a working day, biased back toward the grid (cum 0)
+  let cum=C;
+  for(let idx=si+1; idx<b.plan.length; idx++){
+    if(b.plan[idx].past) continue;
+    let pick=null,bd=Infinity;
+    for(let nc=cum-CFG.nudge; nc<=cum+CFG.nudge; nc++){
+      if(isBlocked(addDays(b.plan[idx].natural, nc))) continue;
+      const d=Math.abs(nc)*10 + Math.abs(nc-cum);            // prefer back toward 0, then least move
+      if(d<bd){ bd=d; pick=nc; }
+    }
+    if(pick===null) pick=cum;
+    const p=b.plan[idx];
+    p.date=addDays(p.natural, pick); p.cum=pick; p.stepMove=pick-cum;
+    p.interval=daysBetween(prevDate,p.date); p.isMot=false;
+    prevDate=p.date; cum=pick;
+  }
   b.plan[si].isMot=true;
   b.inspAlign=b.plan[si]; b.motPlan=mot; b.alignOk=true;
-  b.alignGap=daysBetween(I,mot); b.alignDrift=D;
+  b.alignGap=daysBetween(I,mot); b.alignDrift=C;
   capMap.set(mondayOf(mot),(capMap.get(mondayOf(mot))||0)+1);
 }
 
