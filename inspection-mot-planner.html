@@ -724,18 +724,22 @@ function showBus(fleet){
      '<span><span class="dot" style="background:var(--mot)"></span>MOT-aligned</span>'+
      '<span><span class="dot" style="background:var(--serv)"></span>Year-end service</span></div>';
   h+='<div style="overflow-x:auto"><table class="timeline"><thead><tr><th>#</th><th>Date</th><th>Day</th>'+
-     '<th>Seq</th><th>Service</th><th>Inspection</th><th>Note</th></tr></thead><tbody>';
+     '<th>Seq</th><th>Service</th><th>Inspection</th><th>Day change</th><th>Note</th></tr></thead><tbody>';
   const today=today0();
   b.plan.forEach((p,i)=>{
     const yearEnd=['D','E','F','G'].includes(p.letter);
     const cls=(p.isMot?'mtrow ':'')+(p.past?'past':'');
+    const change = p.nudged
+      ? '<span class="pill warn">moved '+(p.nudged>0?'+':'')+p.nudged+'d</span>'+
+        '<div class="muted small">was '+fmtDow(p.natural)+'</div>'
+      : '<span class="muted">—</span>';
     h+='<tr class="'+(p.isMot?'motline':'')+'"><td class="'+cls+'">'+(i+1)+'</td>'+
        '<td class="'+cls+'">'+fmt(p.date)+'</td><td class="'+cls+'">'+DOW[p.date.getDay()]+'</td>'+
        '<td class="'+cls+'">'+p.seq+'</td>'+
        '<td class="'+cls+'"><span class="pill '+(yearEnd?'serv':'insp')+'">'+p.letter+' · Yr'+p.year+'</span></td>'+
        '<td class="'+cls+'">✓ inspect</td>'+
-       '<td class="'+cls+'">'+(p.isMot?'<span class="pill mot">MOT '+fmt(b.motPlan)+'</span>':
-         (p.nudged?'<span class="muted small">nudged '+(p.nudged>0?'+':'')+p.nudged+'d</span>':''))+'</td></tr>';
+       '<td class="'+cls+'">'+change+'</td>'+
+       '<td class="'+cls+'">'+(p.isMot?'<span class="pill mot">MOT '+fmt(b.motPlan)+'</span>':'')+'</td></tr>';
   });
   h+='</tbody></table></div>';
   el.innerHTML=h;
@@ -745,12 +749,13 @@ function showBus(fleet){
    EXPORT
    ============================================================ */
 function exportCSV(depotCode){
-  const rows=[['Depot Code','Depot','Fleet','Reg','Date','Day','Seq','Service','Year','Inspection','MOT Aligned','MOT Test Date','MOT Due']];
+  const rows=[['Depot Code','Depot','Fleet','Reg','Date','Day','Original Date','Day Change','Seq','Service','Year','Inspection','MOT Aligned','MOT Test Date','MOT Due']];
   const list=Object.values(BUSES).filter(b=>!depotCode || b.depotCode===depotCode);
   list.forEach(b=>{
     const d=DEPOTS[b.depotCode];
     b.plan.forEach(p=>{
-      rows.push([b.depotCode,(d?d.name:''),b.fleet,b.reg||'',iso(p.date),DOW[p.date.getDay()],p.seq,
+      rows.push([b.depotCode,(d?d.name:''),b.fleet,b.reg||'',iso(p.date),DOW[p.date.getDay()],
+        iso(p.natural),(p.nudged?(p.nudged>0?'+':'')+p.nudged+'d':''),p.seq,
         p.letter,'Yr'+p.year,'Y',(p.isMot?'Y':''),(p.isMot&&b.motPlan?iso(b.motPlan):''),
         b.motDue?iso(b.motDue):'']);
     });
