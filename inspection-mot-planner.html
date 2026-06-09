@@ -144,9 +144,14 @@
           <input type="number" id="cfg-horizon" value="24" min="6" max="72">
         </div>
         <div class="col" style="max-width:220px">
-          <label class="fld">MOT buffer before expiry (days)</label>
-          <input type="number" id="cfg-motbuffer" value="14" min="0" max="60">
-          <div class="small muted" style="margin-top:4px">test this many days before due</div>
+          <label class="fld">Target days before MOT due (aim, not over)</label>
+          <input type="number" id="cfg-motbuffer" value="21" min="0" max="60">
+          <div class="small muted" style="margin-top:4px">aim MOT this far before due — e.g. 21 = 3 weeks</div>
+        </div>
+        <div class="col" style="max-width:220px">
+          <label class="fld">Inspection alignment window (months)</label>
+          <input type="number" id="cfg-alignwindow" value="9" min="1" max="18">
+          <div class="small muted" style="margin-top:4px">how far ahead of the MOT to start aligning</div>
         </div>
       </div>
       <div style="margin-top:14px">
@@ -340,7 +345,7 @@ function parseDate(v){
 }
 
 /* ---- global state ---- */
-let CFG = { daysBefore:2, nudge:3, horizon:24, motBuffer:14, bankHol:true, globalBlocked:new Set() };
+let CFG = { daysBefore:2, nudge:3, horizon:24, motBuffer:21, alignWindowMonths:9, bankHol:true, globalBlocked:new Set() };
 let DEPOTS = {};          // code -> {code,name,buses:[fleet...],motDays:Set<int 1..5>,perWeek:int}
 let BUSES  = {};          // fleet -> {fleet,reg,depotCode,anchorDate,anchorIdx,motDue,plan:[],motPlan,inspAlign,alignOk}
 let serviceParsed=false, fleetParsed=false;
@@ -513,6 +518,7 @@ function readGlobalCfg(){
   CFG.nudge=+document.getElementById('cfg-nudge').value||0;
   CFG.horizon=+document.getElementById('cfg-horizon').value||24;
   CFG.motBuffer=+document.getElementById('cfg-motbuffer').value||0;
+  CFG.alignWindowMonths=+document.getElementById('cfg-alignwindow').value||9;
   CFG.bankHol=document.getElementById('cfg-bankhol').checked;
 }
 
@@ -567,31 +573,57 @@ function findMotSlot(motDue, motDays, dep, capMap){
 
 function allowedMot(d,motDays){ return motDays.has(d.getDay()) && !isBlocked(d); }
 
-/* Try to align one inspection to a MOT: nudge the inspection within ±CFG.nudge so that an
-   allowed MOT day lands ~CFG.daysBefore after it, on/before expiry, with depot capacity free. */
-function tryAlign(insp, motDue, motDays, dep, capMap){
-  const order=[]; for(let k=0;k<=CFG.nudge;k++){ order.push(k); if(k) order.push(-k); }
-  let best=null,bestScore=1e9;
-  for(const delta of order){
-    const inspDate=addDays(insp.natural, delta);
-    if(isBlocked(inspDate)) continue;                 // inspection must be a working day
-    const motTarget=addDays(inspDate, CFG.daysBefore);
-    for(let off=0; off<=21; off++){
-      for(const sgn of (off===0?[1]:[1,-1])){
-        const d=addDays(motTarget, sgn*off);
-        if(d<=inspDate || d>motDue) continue;         // MOT after inspection, on/before expiry
-        if(!allowedMot(d,motDays)) continue;
-        if((capMap.get(mondayOf(d))||0) >= dep.perWeek) continue;
-        const score=Math.abs(delta)*2 + off;          // prefer small nudge & MOT near target gap
-        if(score<bestScore){ bestScore=score; best={inspDate, motDate:new Date(d)}; }
-      }
-    }
+/* Drift the run-up cadence so an inspection lands CFG.daysBefore before the MOT, with the MOT
+   itself ~CFG.motBuffer days before due (e.g. 3 weeks). MOT-first: for each allowed MOT day in
+   the window we need its inspection (MOT − daysBefore) to be reachable by drifting some cadence
+   step. Each of the k 42-day intervals before a step may flex ±CFG.nudge, so that step can move
+   up to ±(nudge*k) from its natural date. We pick the MOT closest to the 3-weeks-before-due
+   target that is reachable with the least drift. Returns null if nothing is reachable. */
+function alignBusMot(b, motDays, dep, capMap){
+  const due=b.motDue;
+  const idealMot=addDays(due, -CFG.motBuffer);
+  const winStart=addDays(due, -Math.round(CFG.alignWindowMonths*30.5));
+  const steps=[]; let firstFut=-1;
+  b.plan.forEach((p,idx)=>{ if(!p.past && p.natural<=due && p.natural>=winStart){ if(firstFut<0)firstFut=idx; steps.push(idx); } });
+  if(!steps.length) return null;
+  let best=null,bestScore=Infinity;
+  for(let M=new Date(winStart); M<=due; M=addDays(M,1)){
+    if(!allowedMot(M,motDays)) continue;                        // depot MOT day, not blocked
+    if((capMap.get(mondayOf(M))||0) >= dep.perWeek) continue;   // weekly capacity free
+    let I=addDays(M, -CFG.daysBefore);                          // inspection sits daysBefore earlier
+    if(isBlocked(I)) I=nextWorking(I,-1);                       // keep the inspection on a working day
+    if(I>=M) continue;
+    // find the cadence step that can reach I with the least drift
+    let si=-1,D=1e9;
+    steps.forEach(s=>{ const k=s-firstFut; const maxDrift=CFG.nudge*Math.max(1,k);
+      const d=daysBetween(b.plan[s].natural, I);
+      if(Math.abs(d)<=maxDrift && Math.abs(d)<Math.abs(D)){ si=s; D=d; } });
+    if(si<0) continue;
+    // prefer MOT nearest the 3-weeks-before-due target; tie-break on least cadence disruption
+    const score=Math.abs(daysBetween(M,idealMot))*3 + Math.abs(D);
+    if(score<bestScore){ bestScore=score; best={si,D,I:new Date(I),mot:new Date(M),k:si-firstFut,firstFut}; }
   }
   return best;
 }
 
-/* Inspection-driven scheduling: pick the latest inspection in the window before each MOT and
-   pull the MOT to it. Buses processed soonest-MOT-first so capacity fills fairly. */
+/* Apply a chosen drift to the plan: ramp the shift across the run-up intervals (each ≤ ±nudge),
+   then carry the full drift forward. Marks the aligned inspection + records per-step day changes. */
+function applyDrift(b, a, capMap){
+  const {si,D,I,mot,k,firstFut}=a;
+  b.plan.forEach((p,idx)=>{
+    if(p.past || idx<firstFut) return;
+    let shift = idx<=si ? Math.round(D*(idx-firstFut)/Math.max(1,k)) : D;
+    let nd=addDays(p.natural, shift);
+    if(idx!==si && isBlocked(nd)) nd=nextWorking(nd,1);   // keep projected inspections on working days
+    p.date=nd; p.nudged=daysBetween(p.natural,p.date); p.isMot=false;
+  });
+  b.plan[si].date=I; b.plan[si].nudged=D; b.plan[si].isMot=true;
+  b.inspAlign=b.plan[si]; b.motPlan=mot; b.alignOk=true;
+  b.alignGap=daysBetween(I,mot); b.alignDrift=D;
+  capMap.set(mondayOf(mot),(capMap.get(mondayOf(mot))||0)+1);
+}
+
+/* Schedule MOTs: buses processed soonest-MOT-first so depot weekly capacity fills fairly. */
 function scheduleMots(today){
   const capacity={};
   const cap=code=>capacity[code]||(capacity[code]=new Map());
@@ -602,26 +634,17 @@ function scheduleMots(today){
     const motDays=dep.motDays&&dep.motDays.size?dep.motDays:new Set([1,2,3,4,5]);
     if(b.motDue<today) b.overdue=true;
     const capMap=cap(b.depotCode);
-    // candidate inspections: future, on/before expiry, within a few months of due — latest first
-    const winStart=addDays(b.motDue, -(CFG.motBuffer+56));
-    const cands=b.plan.filter(p=>!p.past && p.natural<=b.motDue && p.natural>=addDays(winStart,-7))
-                      .sort((a,c)=>c.natural-a.natural);
-    let chosen=null;
-    for(const insp of cands){ const r=tryAlign(insp,b.motDue,motDays,dep,capMap); if(r){ chosen={insp,r}; break; } }
-    if(chosen){
-      const {insp,r}=chosen;
-      insp.date=r.inspDate; insp.isMot=true; insp.nudged=daysBetween(insp.natural,r.inspDate);
-      b.inspAlign=insp; b.motPlan=r.motDate; b.alignOk=true; b.alignGap=daysBetween(r.inspDate,r.motDate);
-      capMap.set(mondayOf(r.motDate),(capMap.get(mondayOf(r.motDate))||0)+1);
-    } else {
-      // fallback: still book a MOT on the latest allowed slot before due, even if no inspection aligns
+    const a=alignBusMot(b, motDays, dep, capMap);
+    if(a){ applyDrift(b, a, capMap); }
+    else {
+      // fallback: book a MOT on the latest allowed slot before due, even if no inspection aligns
       const mt=findMotSlot(b.motDue, motDays, dep, capMap);
       b.motPlan=mt; b.alignOk=false;
       if(mt){ capMap.set(mondayOf(mt),(capMap.get(mondayOf(mt))||0)+1);
         let best=null,bd=1e9; const tgt=addDays(mt,-CFG.daysBefore);
         b.plan.forEach(p=>{ if(p.past) return; const df=Math.abs(daysBetween(p.natural,tgt)); if(df<bd){bd=df;best=p;} });
         b.inspAlign=best; b.alignNearGap=best?Math.round(bd):null;
-        b.note='No inspection within ±'+CFG.nudge+'d of an allowed MOT slot — nearest is '+(best?Math.round(bd):'∞')+'d';
+        b.note='Could not drift an inspection to an allowed MOT slot before due';
       } else { b.note='No MOT slot before due (depot days/capacity too tight)'; }
     }
   });
@@ -710,7 +733,9 @@ function renderBuses(){
     const nextStep=b.plan.find(p=>!p.past);
     const align=b.motDue?(b.alignOk?'<span class="pill good">±'+b.inspAlign.nudged+'d</span>':
       '<span class="pill warn">⚠</span>'):'<span class="pill insp">no MOT</span>';
-    const motCell=b.motPlan?fmtDow(b.motPlan)+(b.overdue?' <span class="pill bad">overdue</span>':''):
+    const beforeDue=(b.motPlan&&b.motDue)?daysBetween(b.motPlan,b.motDue):null;
+    const motCell=b.motPlan?fmtDow(b.motPlan)+(b.overdue?' <span class="pill bad">overdue</span>':
+      (beforeDue!=null?' <span class="muted small">('+beforeDue+'d before due)</span>':'')):
       (b.motDue?'<span class="muted">—</span>':'');
     const tr=document.createElement('tr');
     tr.innerHTML='<td><b>'+b.fleet+'</b></td><td>'+(b.reg||'')+'</td><td class="small">'+pos+'</td>'+
@@ -734,7 +759,8 @@ function showBus(fleet){
   let h='<h2>'+b.fleet+' · '+(b.reg||'')+' <span class="tag">'+(d?d.name:'')+'</span></h2>';
   h+='<div class="row"><div class="col small"><div class="muted">MOT next due</div><b>'+(b.motDue?fmtDow(b.motDue):'—')+'</b></div>'+
      '<div class="col small"><div class="muted">Planned MOT test</div><b>'+(b.motPlan?fmtDow(b.motPlan):'—')+
-       (b.overdue?' <span class="pill bad">overdue</span>':'')+'</b></div>'+
+       (b.overdue?' <span class="pill bad">overdue</span>':'')+'</b>'+
+       ((b.motPlan&&b.motDue&&!b.overdue)?'<div class="muted">'+daysBetween(b.motPlan,b.motDue)+' days before due</div>':'')+'</div>'+
      '<div class="col small"><div class="muted">Aligned inspection</div><b>'+(b.inspAlign?fmtDow(b.inspAlign.date):'—')+'</b></div>'+
      '<div class="col small"><div class="muted">Cycle anchor</div><b>'+(b.anchorIdx!=null?
        SEQUENCE[b.anchorIdx].letter+' / seq '+SEQUENCE[b.anchorIdx].seq:'—')+'</b><div class="muted">'+b.anchorSource+'</div></div></div>';
