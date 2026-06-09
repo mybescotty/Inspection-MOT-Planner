@@ -14,6 +14,9 @@ with scope to fix anything found before the certificate expires.
    (Both `.xlsx`; `.csv` also accepted.)
 3. Set the global options and the per-depot MOT days / weekly capacity, then **Generate plan**.
 4. Drill **Depots → bus → plan**. Export the plan to **CSV** or **Print/PDF**.
+5. Inside a depot, any bus that could not be auto-aligned within the rules is listed in a
+   **"Needs manual scheduling"** panel with the reason (overdue, no history, capacity/days too tight,
+   or no inspection fits). Use **Export unaligned** to get that action list as a CSV.
 
 ## How it plans
 - The 48-step 42-day service sequence (`A B A C A B A <year-end>` per year, years 1–6 ending

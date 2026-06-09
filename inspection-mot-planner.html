@@ -202,10 +202,12 @@
     <div class="toolbar">
       <button class="ghost" onclick="showDepots()">← Depots</button>
       <button class="secondary" onclick="exportCSV(currentDepot)">⬇ Export depot CSV</button>
+      <button class="secondary" onclick="exportUnaligned(currentDepot)">⚠ Export unaligned</button>
       <button class="secondary" onclick="window.print()">🖨 Print</button>
       <input type="text" id="bus-search" placeholder="Filter buses (fleet / reg)…" oninput="renderBuses()">
       <span class="small muted" id="bus-summary"></span>
     </div>
+    <div id="unaligned-panel"></div>
     <div class="card">
       <h2 id="depot-title"></h2>
       <div style="overflow-x:auto">
@@ -762,10 +764,43 @@ function showBuses(code){
   document.getElementById('depot-title').textContent=d.name+' — '+(d.busObjs||[]).length+' buses';
   renderBuses();
 }
+/* Why a bus with a MOT could not be auto-aligned within the rules */
+function unalignedReason(b){
+  if(!b.motDue) return '';
+  if(b.alignOk) return '';
+  if(b.anchorIdx==null || !b.plan.length) return 'No service history to project a cadence from';
+  if(b.overdue) return 'MOT already overdue';
+  if(!b.motPlan) return 'No MOT slot before due — depot MOT days / weekly capacity too tight';
+  return 'No inspection fits within ±'+CFG.nudge+' working days of an allowed MOT before due';
+}
+function needsAction(b){ return b.motDue && !b.alignOk; }
+
+function renderUnalignedPanel(depotObjs){
+  const panel=document.getElementById('unaligned-panel'); panel.innerHTML='';
+  const list=depotObjs.filter(needsAction).sort((a,b)=>(a.motDue||9e15)-(b.motDue||9e15));
+  if(!list.length){ return; }
+  let h='<div class="card" style="border-color:#7c5e12;background:#221a06">'+
+    '<h2 style="color:#fcd34d">⚠ Needs manual scheduling <span class="tag">'+list.length+
+    ' bus'+(list.length>1?'es':'')+' could not be auto-aligned within the rules</span></h2>'+
+    '<div style="overflow-x:auto"><table><thead><tr><th>Fleet</th><th>Reg</th><th>MOT due</th>'+
+    '<th>Booked MOT</th><th>Why</th><th></th></tr></thead><tbody>';
+  list.forEach(b=>{
+    const booked=b.motPlan?fmtDow(b.motPlan):'<span class="muted">none</span>';
+    h+='<tr><td><b>'+b.fleet+'</b></td><td>'+(b.reg||'')+'</td>'+
+       '<td class="small">'+(b.motDue?fmt(b.motDue):'—')+(b.overdue?' <span class="pill bad">overdue</span>':'')+'</td>'+
+       '<td class="small">'+booked+'</td>'+
+       '<td class="small alignbad">'+unalignedReason(b)+'</td>'+
+       '<td><button class="ghost small" onclick="showBus(\''+b.fleet+'\')">Plan →</button></td></tr>';
+  });
+  h+='</tbody></table></div></div>';
+  panel.innerHTML=h;
+}
+
 function renderBuses(){
   const d=DEPOTS[currentDepot]; const q=(document.getElementById('bus-search').value||'').toLowerCase();
   const body=document.getElementById('buses-body'); body.innerHTML='';
   let objs=(d.busObjs||[]).slice().sort((a,b)=>(a.motDue||9e15)-(b.motDue||9e15));
+  renderUnalignedPanel(objs);
   let shown=0;
   objs.forEach(b=>{
     if(q && !(b.fleet.toLowerCase().includes(q)||(b.reg||'').toLowerCase().includes(q))) return;
@@ -773,8 +808,8 @@ function renderBuses(){
     const pos=b.anchorIdx!=null?('Yr'+SEQUENCE[b.anchorIdx].year+' '+SEQUENCE[b.anchorIdx].letter+
       ' (seq '+SEQUENCE[b.anchorIdx].seq+')'):'—';
     const nextStep=b.plan.find(p=>!p.past);
-    const align=b.motDue?(b.alignOk?'<span class="pill good">±'+b.inspAlign.nudged+'d</span>':
-      '<span class="pill warn">⚠</span>'):'<span class="pill insp">no MOT</span>';
+    const align=b.motDue?(b.alignOk?'<span class="pill good">✓ aligned</span>':
+      '<span class="pill warn">⚠ manual</span>'):'<span class="pill insp">no MOT</span>';
     const beforeDue=(b.motPlan&&b.motDue)?daysBetween(b.motPlan,b.motDue):null;
     const motCell=b.motPlan?fmtDow(b.motPlan)+(b.overdue?' <span class="pill bad">overdue</span>':
       (beforeDue!=null?' <span class="muted small">('+beforeDue+'d before due)</span>':'')):
@@ -854,10 +889,27 @@ function exportCSV(depotCode){
         b.motDue?iso(b.motDue):'']);
     });
   });
+  downloadCSV(rows, 'inspection-mot-plan'+(depotCode?'-'+depotCode:''));
+}
+
+/* Export just the buses that need manual scheduling (optionally for one depot) */
+function exportUnaligned(depotCode){
+  const rows=[['Depot Code','Depot','Fleet','Reg','MOT Due','Overdue','Booked MOT','Reason']];
+  const list=Object.values(BUSES).filter(b=>(!depotCode||b.depotCode===depotCode) && needsAction(b))
+    .sort((a,b)=>(a.depotCode>b.depotCode?1:-1)||((a.motDue||9e15)-(b.motDue||9e15)));
+  list.forEach(b=>{ const d=DEPOTS[b.depotCode];
+    rows.push([b.depotCode,(d?d.name:''),b.fleet,b.reg||'',b.motDue?iso(b.motDue):'',
+      b.overdue?'Y':'',b.motPlan?iso(b.motPlan):'',unalignedReason(b)]);
+  });
+  if(rows.length===1){ alert('No buses need manual scheduling'+(depotCode?' in this depot':'')+'.'); return; }
+  downloadCSV(rows, 'unaligned-buses'+(depotCode?'-'+depotCode:''));
+}
+
+function downloadCSV(rows, name){
   const csv=rows.map(r=>r.map(c=>{c=String(c); return /[",\n]/.test(c)?'"'+c.replace(/"/g,'""')+'"':c;}).join(',')).join('\n');
   const blob=new Blob([csv],{type:'text/csv'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
-  a.download='inspection-mot-plan'+(depotCode?'-'+depotCode:'')+'.csv'; a.click();
+  a.download=name+'.csv'; a.click();
 }
 
 /* ============================================================
