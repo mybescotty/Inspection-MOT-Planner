@@ -328,6 +328,7 @@ function depotDefault(code){
 
 const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 function iso(d){ const z=new Date(d.getTime()-d.getTimezoneOffset()*60000); return z.toISOString().slice(0,10); }
+function fromIso(s){ const p=s.split('-'); return new Date(+p[0], +p[1]-1, +p[2]); }
 function fmt(d){ if(!d) return '—'; return d.getDate().toString().padStart(2,'0')+' '+
   ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()]+' '+d.getFullYear(); }
 function fmtDow(d){ if(!d) return '—'; return DOW[d.getDay()]+' '+fmt(d); }
@@ -545,20 +546,35 @@ function findAnchor(hist, today){
   return {idx:null,date:null,source:'no service data'};
 }
 
+/* Working day in [center-nudge, center+nudge] closest to `center` (prefers exactly center, then the
+   smallest move). Returns null if the whole ±nudge window is blocked (can't happen for nudge≥3 —
+   any 7-day span has a weekday — but guarded anyway). */
+function workingNear(center){
+  if(!isBlocked(center)) return new Date(center);
+  for(let k=1;k<=CFG.nudge;k++){
+    const a=addDays(center,-k); if(!isBlocked(a)) return a;
+    const b=addDays(center, k); if(!isBlocked(b)) return b;
+  }
+  return null;
+}
+
 function projectPlan(idx,startDate,today){
   const end=addDays(today, Math.round(CFG.horizon*30.5));
-  let d=new Date(startDate); const plan=[]; let i=idx; let guard=0;
-  while(d<addDays(today,-CYCLE_DAYS) && guard++<400){ d=addDays(d,CYCLE_DAYS); i=nextIndex(i); }
-  guard=0;
+  let i=idx; let guard=0;
+  // baseline cadence as a true chain: each gap is 42 ± nudge and every date is a working day
+  let d=nextWorking(new Date(startDate),1);
+  while(d<addDays(today,-CYCLE_DAYS) && guard++<400){
+    const nx=workingNear(addDays(d,CYCLE_DAYS)); d=nx||addDays(d,CYCLE_DAYS); i=nextIndex(i);
+  }
+  const plan=[]; guard=0;
   while(d<=end && guard++<400){
     const s=SEQUENCE[i];
-    // snap every projected inspection to a working day so no inspection ever falls on a
-    // weekend or bank holiday — even before any MOT-alignment drift is applied
-    const wd=nearestWorking(d);
-    plan.push({date:new Date(wd),natural:new Date(wd),idx:i,seq:s.seq,letter:s.letter,year:s.year,
-      inspection:true,isMot:false,past:wd<today,nudged:0});
-    d=addDays(d,CYCLE_DAYS); i=nextIndex(i);
+    plan.push({date:new Date(d),natural:new Date(d),idx:i,seq:s.seq,letter:s.letter,year:s.year,
+      inspection:true,isMot:false,past:d<today,stepMove:0,interval:CYCLE_DAYS});
+    const nx=workingNear(addDays(d,CYCLE_DAYS)); d=nx||addDays(d,CYCLE_DAYS); i=nextIndex(i);
   }
+  // record each step's true interval/stepMove against the previous chain date
+  for(let k=1;k<plan.length;k++){ plan[k].interval=daysBetween(plan[k-1].date,plan[k].date); plan[k].stepMove=plan[k].interval-CYCLE_DAYS; }
   return plan;
 }
 
@@ -581,20 +597,22 @@ function findMotSlot(motDue, motDays, dep, capMap){
 
 function allowedMot(d,motDays){ return motDays.has(d.getDay()) && !isBlocked(d); }
 
-/* Working-day reachability: from the anchor (cum 0) walk the cadence forward; at each 42-day step
-   the interval may flex by ±CFG.nudge (so cum changes by ≤±nudge) BUT the resulting inspection
-   date (grid + cum) must be a working day. reach[level] maps each reachable cum → its parent cum,
-   so a valid all-working-day, ≤±3-per-step path can be reconstructed. */
+/* Working-day reachability over ACTUAL dates. reach[level] maps each reachable inspection date
+   (ISO string → parent ISO) at that step. Transition: from a date d, every working day in
+   [d+42-nudge, d+42+nudge]. So "reachable" means a genuine chain whose every gap is 42 ± nudge and
+   every date is a working day — the real interval rule, not an offset proxy. */
 function forwardReach(b, firstFut, lastStep){
-  const reach=[]; reach[firstFut]=new Map([[0,null]]);
+  const reach=[]; const a0=b.plan[firstFut].date;
+  reach[firstFut]=new Map([[iso(a0), null]]);
   for(let lvl=firstFut; lvl<lastStep; lvl++){
     const cur=reach[lvl]; if(!cur || !cur.size) break;
     const nxt=new Map();
-    cur.forEach((_,cum)=>{
-      for(let dd=-CFG.nudge; dd<=CFG.nudge; dd++){
-        const ncum=cum+dd;
-        if(isBlocked(addDays(b.plan[lvl+1].natural, ncum))) continue;   // inspection must be a working day
-        if(!nxt.has(ncum)) nxt.set(ncum, cum);
+    cur.forEach((_,key)=>{
+      const d=fromIso(key);
+      for(let g=CYCLE_DAYS-CFG.nudge; g<=CYCLE_DAYS+CFG.nudge; g++){
+        const nd=addDays(d,g);
+        if(isBlocked(nd)) continue;                            // inspection must be a working day
+        const k=iso(nd); if(!nxt.has(k)) nxt.set(k, key);
       }
     });
     reach[lvl+1]=nxt;
@@ -603,15 +621,15 @@ function forwardReach(b, firstFut, lastStep){
 }
 
 /* Aim an inspection CFG.daysBefore before an allowed MOT day (MOT ~CFG.motBuffer before due, never
-   over), but ONLY where the inspection date is reachable by an all-working-day, ≤±3-per-step drift
-   chain. Returns null (→ leave unaligned, never forced) if no rule-respecting alignment exists. */
+   over), but ONLY where that inspection date is reachable by an all-working-day chain whose every
+   gap is 42 ± nudge. Returns null (→ leave unaligned, never forced) if no such alignment exists. */
 function alignBusMot(b, motDays, dep, capMap){
   const due=b.motDue;
   const idealMot=addDays(due, -CFG.motBuffer);
   const winStart=addDays(due, -Math.round(CFG.alignWindowMonths*30.5));
   const steps=[]; let firstFut=-1, lastStep=-1;
-  b.plan.forEach((p,idx)=>{ if(!p.past && p.natural<=due && p.natural>=winStart){ if(firstFut<0)firstFut=idx; lastStep=idx; steps.push(idx); } });
-  if(!steps.length || isBlocked(b.plan[firstFut].natural)) return null;
+  b.plan.forEach((p,idx)=>{ if(!p.past && p.date<=due && p.date>=winStart){ if(firstFut<0)firstFut=idx; lastStep=idx; steps.push(idx); } });
+  if(!steps.length || isBlocked(b.plan[firstFut].date)) return null;
   const reach=forwardReach(b, firstFut, lastStep);
   let best=null,bestScore=Infinity;
   for(let M=new Date(winStart); M<=due; M=addDays(M,1)){
@@ -620,50 +638,48 @@ function alignBusMot(b, motDays, dep, capMap){
     let I=addDays(M, -CFG.daysBefore);
     if(isBlocked(I)) I=nextWorking(I,-1);                       // inspection on a working day
     if(I>=M) continue;
+    const key=iso(I);
     steps.forEach(si=>{
-      if(!reach[si]) return;
-      const C=daysBetween(b.plan[si].natural, I);
-      if(!reach[si].has(C)) return;                            // I reachable by a working-day ≤±3 chain
-      const score=Math.abs(daysBetween(M,idealMot))*3 + Math.abs(C);
-      if(score<bestScore){ bestScore=score; best={si,C,I:new Date(I),mot:new Date(M),firstFut,reach}; }
+      if(!reach[si] || !reach[si].has(key)) return;            // I reachable as a 42±nudge working-day chain
+      const drift=Math.abs(daysBetween(b.plan[si].date, I));   // how far from the bus's own cadence
+      const score=Math.abs(daysBetween(M,idealMot))*3 + drift;
+      if(score<bestScore){ bestScore=score; best={si,I:new Date(I),mot:new Date(M),firstFut,reach}; }
     });
   }
   return best;
 }
 
-/* Apply the chosen alignment: reconstruct the working-day drift path up to the aligned inspection,
-   then walk the cadence back toward its original dates afterward. Every step stays on a working day
-   and moves ≤±nudge; stepMove records each inspection's own move (never more than ±nudge). */
+/* Apply the chosen alignment: reconstruct the working-day date chain up to the aligned inspection,
+   then walk forward back toward the baseline dates so later inspections return to normal. Every gap
+   stays 42 ± nudge; stepMove = interval − 42 is the real, displayed deviation. */
 function applyDrift(b, a, capMap){
-  const {si,C,I,mot,firstFut,reach}=a;
-  const cumAt={}; let lvl=si, cur=C;
-  while(lvl>=firstFut){ cumAt[lvl]=cur; if(lvl===firstFut) break; cur=reach[lvl].get(cur); lvl--; }
-  let prevDate=null, prevCum=0, first=true;
+  const {si,I,mot,firstFut,reach}=a;
+  const dateAt={}; let lvl=si, key=iso(I);
+  while(lvl>=firstFut){ dateAt[lvl]=fromIso(key); if(lvl===firstFut) break; key=reach[lvl].get(key); lvl--; }
+  // seed prev with the step just before the window so the first step's gap stays correct
+  let prev = firstFut>0 ? b.plan[firstFut-1].date : null;
   for(let idx=firstFut; idx<=si; idx++){
-    const cum=cumAt[idx], p=b.plan[idx];
-    p.date = idx===si ? new Date(I) : addDays(p.natural, cum);
-    p.cum=cum; p.stepMove=first?0:(cum-prevCum); p.interval=prevDate?daysBetween(prevDate,p.date):42; p.isMot=false;
-    prevCum=cum; prevDate=p.date; first=false;
+    const p=b.plan[idx]; p.date=dateAt[idx];
+    p.interval=prev?daysBetween(prev,p.date):CYCLE_DAYS; p.stepMove=prev?p.interval-CYCLE_DAYS:0; p.isMot=false;
+    prev=p.date;
   }
-  // revert: each later inspection moves ≤±nudge on a working day, biased back toward the grid (cum 0)
-  let cum=C;
+  // revert: each later inspection is the in-range working day closest to its baseline (natural) date
   for(let idx=si+1; idx<b.plan.length; idx++){
     if(b.plan[idx].past) continue;
+    const p=b.plan[idx]; const center=addDays(prev,CYCLE_DAYS);
     let pick=null,bd=Infinity;
-    for(let nc=cum-CFG.nudge; nc<=cum+CFG.nudge; nc++){
-      if(isBlocked(addDays(b.plan[idx].natural, nc))) continue;
-      const d=Math.abs(nc)*10 + Math.abs(nc-cum);            // prefer back toward 0, then least move
-      if(d<bd){ bd=d; pick=nc; }
+    for(let g=CYCLE_DAYS-CFG.nudge; g<=CYCLE_DAYS+CFG.nudge; g++){
+      const nd=addDays(prev,g); if(isBlocked(nd)) continue;
+      const d=Math.abs(daysBetween(nd,p.natural))*10 + Math.abs(g-CYCLE_DAYS);  // toward baseline, least move
+      if(d<bd){ bd=d; pick=nd; }
     }
-    if(pick===null) pick=cum;
-    const p=b.plan[idx];
-    p.date=addDays(p.natural, pick); p.cum=pick; p.stepMove=pick-cum;
-    p.interval=daysBetween(prevDate,p.date); p.isMot=false;
-    prevDate=p.date; cum=pick;
+    if(!pick) pick=workingNear(center)||center;
+    p.date=pick; p.interval=daysBetween(prev,p.date); p.stepMove=p.interval-CYCLE_DAYS; p.isMot=false;
+    prev=p.date;
   }
   b.plan[si].isMot=true;
   b.inspAlign=b.plan[si]; b.motPlan=mot; b.alignOk=true;
-  b.alignGap=daysBetween(I,mot); b.alignDrift=C;
+  b.alignGap=daysBetween(I,mot); b.alignDrift=daysBetween(b.plan[si].natural, I);
   capMap.set(mondayOf(mot),(capMap.get(mondayOf(mot))||0)+1);
 }
 
